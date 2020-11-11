@@ -996,6 +996,7 @@ class Collection(object):
              allow_partial_results=False, oplog_replay=False, modifiers=None,
              batch_size=0, manipulate=True, collation=None, session=None,
              max_time_ms=None, **kwargs):
+
         spec = filter
         if spec is None:
             spec = {}
@@ -1256,7 +1257,7 @@ class Collection(object):
             filter_applies(filter, {})
 
         return (document for document in list(self._store.documents)
-                if filter_applies(filter, document))
+                if filter_applies(filter, document, **{'indexes': self._store.indexes}))
 
     def find_one(self, filter=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
         # Allow calling find_one with a non-dict argument that gets used as
@@ -1469,8 +1470,23 @@ class Collection(object):
             index_dict['sparse'] = True
         if is_unique:
             index_dict['unique'] = True
+
         if 'expireAfterSeconds' in kwargs and kwargs['expireAfterSeconds'] is not None:
             index_dict['expireAfterSeconds'] = kwargs.pop('expireAfterSeconds')
+
+
+        if 'default_language' in kwargs:
+
+            if kwargs.get('default_language') == None:
+                # the default language is set to english
+                # this is the default behaviour with pymongo
+                kwargs['default_language'] = 'english'
+
+
+            index_dict['default_language'] = kwargs.pop('default_language')
+
+        if 'weights' in kwargs:
+            raise NotImplementedError('Weight are currently not supported by mongomock')
 
         existing_index = self._store.indexes.get(index_name)
         if existing_index and index_dict != existing_index:

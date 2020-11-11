@@ -1,4 +1,5 @@
 from datetime import datetime
+from functools import partial
 import itertools
 import uuid
 
@@ -10,6 +11,9 @@ import operator
 import re
 from sentinels import NOTHING
 from six import iteritems, string_types, PY3
+from collections import namedtuple
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem import PorterStemmer
 try:
     from types import NoneType
 except ImportError:
@@ -22,8 +26,9 @@ except ImportError:
     DBRef = None
     _RE_TYPES = (RE_TYPE,)
 
-_TOP_LEVEL_OPERATORS = {'$expr', '$text', '$where', '$jsonSchema'}
+_TOP_LEVEL_OPERATORS = {'$expr', '$where', '$jsonSchema'}
 
+_SUPPORTED_TOP_LEVEL_OPERATORS = {'$text'}
 
 _NOT_IMPLEMENTED_OPERATORS = {
     '$bitsAllClear',
@@ -36,16 +41,21 @@ _NOT_IMPLEMENTED_OPERATORS = {
     '$minDistance',
     '$near',
     '$nearSphere',
+    '$language',
+    '$diacriticSensitive'
 }
 
+TextSearchTuple = namedtuple('TextSearchTuple', ['match_set', 'case_sensitive', 'negation_set', \
+                                                 'keys_to_be_searched', 'language'])
 
-def filter_applies(search_filter, document):
+
+def filter_applies(search_filter, document, **kwargs):
     """Applies given filter
 
     This function implements MongoDB's matching strategy over documents in the find() method
     and other related scenarios (like $elemMatch)
     """
-    return _filterer_inst.apply(search_filter, document)
+    return _filterer_inst.apply(search_filter, document, **kwargs)
 
 
 class _Filterer(object):
@@ -62,13 +72,14 @@ class _Filterer(object):
             '$regex': _not_nothing_and(_regex),
             '$elemMatch': self._elem_match_op,
             '$size': _size_op,
-            '$type': _type_op
+            '$type': _type_op,
+            '$search': _text_search_op
         }, **{
             key: _not_nothing_and(_list_expand(_compare_objects(op)))
             for key, op in iteritems(SORTING_OPERATOR_MAP)
         })
 
-    def apply(self, search_filter, document):
+    def apply(self, search_filter, document, **kwargs):
         if not isinstance(search_filter, dict):
             raise OperationFailure('the match filter must be an expression in an object')
 
@@ -85,7 +96,7 @@ class _Filterer(object):
             if key in _TOP_LEVEL_OPERATORS:
                 raise NotImplementedError(
                     'The {} operator is not implemented in mongomock yet'.format(key))
-            if key.startswith('$'):
+            if key.startswith('$') and key not in _SUPPORTED_TOP_LEVEL_OPERATORS:
                 raise OperationFailure('unknown top level operator: ' + key)
 
             is_match = False
@@ -113,6 +124,14 @@ class _Filterer(object):
                 if is_ops_filter:
                     if '$options' in search and '$regex' in search:
                         search = _combine_regex_options(search)
+
+                    if key == '$text':
+                        # if we are trying to do search
+                        indexes = kwargs.get('indexes')
+
+                        if '$search' in search:
+                            search = _combine_text_search_options(search, indexes)
+
                     unknown_operators = set(search) - set(self._operator_map) - {'$not'}
                     if unknown_operators:
                         not_implemented_operators = unknown_operators & _NOT_IMPLEMENTED_OPERATORS
@@ -191,12 +210,23 @@ class _Filterer(object):
                 matches.append(x in dv)
         return all(matches)
 
+def process_key(key):
+    if key == '$text':
+        # TODO: Add funtionality to specify
+        # a text index on startup and pickup
+        # the keys from there.
+        return None
+
+    return key
+
 
 def iter_key_candidates(key, doc):
     """Get possible subdocuments or lists that are referred to by the key in question
 
     Returns the appropriate nested value if the key includes dot notation.
     """
+    key = process_key(key)
+
     if doc is None:
         return ()
 
@@ -409,6 +439,66 @@ def _type_op(doc_val, search_val):
         raise NotImplementedError('%s is a valid $type but not implemented' % search_val)
     return isinstance(doc_val, TYPE_MAP[search_val])
 
+def _text_search_op(doc_val, search_val):
+
+    keys_to_be_searched = search_val.keys_to_be_searched
+    for key, value in doc_val.items():
+        if '$**' not in keys_to_be_searched and \
+            key not in keys_to_be_searched:
+            continue
+
+        if text_search(value, search_val):
+            return True
+
+    return False
+
+def text_search(curr_value, search_criteria):
+
+    if isinstance(curr_value, str):
+        return search_string(curr_value, search_criteria)
+
+    elif isinstance(curr_value, dict):
+        for key, value in curr_value.items():
+            if text_search(value, search_criteria):
+                return True
+
+    elif isinstance(curr_value, list):
+        for value in curr_value:
+            if text_search(value, search_criteria):
+                return True
+
+    return False
+
+
+def search_string(curr_string, search_val):
+
+    if search_val.case_sensitive == False:
+        curr_string = curr_string.lower()
+
+    curr_string = _prepare_search_string(curr_string)
+
+    return _match(curr_string, search_val)
+
+
+def _prepare_search_string(search_string):
+    tokenizer = RegexpTokenizer(r'\w+')
+    stemmer = PorterStemmer()
+    return set([stemmer.stem(i) for i in tokenizer.tokenize(search_string)])
+
+def _match(search_string, search_val):
+    match_comparer = lambda x: True if len(x) > 0 else False
+    negation_comparer = lambda x: True if len(x) < 1 else False
+
+    search_eval = lambda x, search_val: _evaluate_text_search(x, search_val) if isinstance(x, str) else False
+
+    matcher = partial(_evaluate_text_search, search_string)
+
+    return all([matcher(search_val.negation_set, negation_comparer),
+                matcher(search_val.match_set, match_comparer)])
+
+
+def _evaluate_text_search(searched_set, compare_set, comparer):
+    return comparer(searched_set.intersection(compare_set))
 
 def _combine_regex_options(search):
     if not isinstance(search['$options'], string_types):
@@ -442,6 +532,61 @@ def _combine_regex_options(search):
         search_copy['$regex'] = re.compile(search['$regex'], options)
     return search_copy
 
+
+def _combine_text_search_options(search, index_info):
+
+    if '$caseSensitive' not in search:
+        return search
+
+    if not isinstance(search['$caseSensitive'], bool):
+        raise OperationFailure('$caseSensitive has to be a bool')
+
+    search_copy = dict(search)
+
+    sensitivity_value = search.get('$caseSensitive')
+    del search_copy['$caseSensitive']
+
+    search_string = search.get('$search')
+    search_copy['$search'] = parse_text_search_query(search_string, sensitivity_value, index_info)
+    return search_copy
+
+
+def parse_text_search_query(search_string, case_sensitivity_value, index_info):
+    search_criteria = [ _sanitize_search_space(i.strip()) for i in filter(None,search_string.split('"'))]
+
+    negation_set = set()
+    search_set = set()
+
+    for search_word in search_criteria:
+
+        if '-' in search_word:
+            negation_set.add(_sanitize_seach_term(search_word.replace('-', '').strip()))
+            continue
+
+        search_set.add(_sanitize_seach_term(search_word))
+
+    if case_sensitivity_value == True:
+        search_set = set([i.lower() for i in search_set])
+        negation_set = set([i.lower() for i in negation_set])
+
+    for index,index_val in index_info.items():
+        # only one text index is allowed for a collection
+        # https://docs.mongodb.com/manual/core/index-text/#one-text-index-per-collection
+        index_keys = index_val.get('key')
+        default_language = index_val.get('default_language', 'english')
+        search_keys = set([i[0] for i in index_keys if isinstance(i, tuple) and i[1] == 'text'])
+
+    return TextSearchTuple(match_set=search_set,negation_set=negation_set,
+                           case_sensitive=case_sensitivity_value,
+                           keys_to_be_searched=search_keys,
+                           language=default_language)
+
+def _sanitize_search_space(word):
+    stemmer = PorterStemmer()
+    return stemmer.stem(''.join(e for e in word if e.isalnum()))
+
+def _sanitize_seach_term(word):
+    return word.strip('_+!@#$?^/')
 
 def operator_eq(doc_val, search_val):
     if doc_val is NOTHING and search_val is None:
